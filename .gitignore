@@ -1,0 +1,5 @@
+# Local dependency checkouts
+external/
+
+# macOS
+.DS_Store

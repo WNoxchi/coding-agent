@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -31,6 +32,10 @@ const (
 	hardListFilesMaxEntries    = 2000
 	defaultReadFilesMaxBytes   = 32_000
 	hardReadFilesMaxBytes      = 256_000
+	defaultBashTimeoutSeconds  = 30
+	hardBashTimeoutSeconds     = 120
+	defaultBashMaxOutputBytes  = 32_000
+	hardBashMaxOutputBytes     = 256_000
 
 	userColor   = "\x1b[38;2;102;178;255m"
 	claudeColor = "\x1b[38;2;217;119;6m"
@@ -72,6 +77,12 @@ type ListFilesInput struct {
 type ReadFilesInput struct {
 	Path     string `json:"path"`
 	MaxBytes int    `json:"max_bytes,omitempty"`
+}
+
+type BashInput struct {
+	Command        string `json:"command"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+	MaxOutputBytes int    `json:"max_output_bytes,omitempty"`
 }
 
 func main() {
@@ -325,6 +336,12 @@ func runTool(toolMap map[string]ToolDefinition, toolUse ToolUse) (string, bool) 
 func registeredTools() []ToolDefinition {
 	return []ToolDefinition{
 		{
+			Name:        "bash",
+			Description: "Execute a bash command in the current workspace and return combined stdout/stderr output.",
+			InputSchema: bashInputSchema(),
+			Function:    bashTool,
+		},
+		{
 			Name:        "read_files",
 			Description: "Read the contents of a file in the current workspace. Use this to inspect specific files after discovering paths with list_files.",
 			InputSchema: readFilesInputSchema(),
@@ -362,6 +379,33 @@ func buildToolRegistry(defs []ToolDefinition) (map[string]ToolDefinition, []anth
 	}
 
 	return toolMap, anthropicTools, nil
+}
+
+func bashInputSchema() anthropic.ToolInputSchemaParam {
+	return anthropic.ToolInputSchemaParam{
+		Properties: map[string]any{
+			"command": map[string]any{
+				"type":        "string",
+				"description": "The bash command to execute.",
+			},
+			"timeout_seconds": map[string]any{
+				"type":        "integer",
+				"description": fmt.Sprintf("Optional timeout in seconds. Defaults to %d, capped at %d.", defaultBashTimeoutSeconds, hardBashTimeoutSeconds),
+				"minimum":     1,
+				"maximum":     hardBashTimeoutSeconds,
+			},
+			"max_output_bytes": map[string]any{
+				"type":        "integer",
+				"description": fmt.Sprintf("Maximum bytes of command output to return. Defaults to %d, capped at %d.", defaultBashMaxOutputBytes, hardBashMaxOutputBytes),
+				"minimum":     1,
+				"maximum":     hardBashMaxOutputBytes,
+			},
+		},
+		Required: []string{"command"},
+		ExtraFields: map[string]any{
+			"additionalProperties": false,
+		},
+	}
 }
 
 func readFilesInputSchema() anthropic.ToolInputSchemaParam {
@@ -409,6 +453,89 @@ func listFilesInputSchema() anthropic.ToolInputSchemaParam {
 	}
 }
 
+func bashTool(input json.RawMessage) (string, error) {
+	args := BashInput{}
+	raw := strings.TrimSpace(string(input))
+	if raw == "" {
+		raw = "{}"
+	}
+	if err := json.Unmarshal([]byte(raw), &args); err != nil {
+		return "", fmt.Errorf("invalid bash input: %w", err)
+	}
+
+	command := strings.TrimSpace(args.Command)
+	if command == "" {
+		return "", errors.New("command is required")
+	}
+
+	timeoutSeconds := defaultBashTimeoutSeconds
+	if args.TimeoutSeconds > 0 {
+		timeoutSeconds = args.TimeoutSeconds
+	}
+	if timeoutSeconds > hardBashTimeoutSeconds {
+		timeoutSeconds = hardBashTimeoutSeconds
+	}
+
+	maxOutputBytes := defaultBashMaxOutputBytes
+	if args.MaxOutputBytes > 0 {
+		maxOutputBytes = args.MaxOutputBytes
+	}
+	if maxOutputBytes > hardBashMaxOutputBytes {
+		maxOutputBytes = hardBashMaxOutputBytes
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve working directory: %w", err)
+	}
+
+	debugf("bash_tool_start command=%q timeout_seconds=%d max_output_bytes=%d", command, timeoutSeconds, maxOutputBytes)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "bash", "-lc", command)
+	cmd.Dir = cwd
+	output, runErr := cmd.CombinedOutput()
+
+	truncatedOutput, wasTruncated := truncateOutput(output, maxOutputBytes)
+	trimmedOutput := strings.TrimSpace(truncatedOutput)
+
+	if ctx.Err() == context.DeadlineExceeded {
+		msg := fmt.Sprintf("Command timed out after %d seconds.", timeoutSeconds)
+		if trimmedOutput != "" {
+			msg += "\n\nPartial output:\n" + trimmedOutput
+		}
+		if wasTruncated {
+			msg += fmt.Sprintf("\n\n(output truncated at max_output_bytes=%d)", maxOutputBytes)
+		}
+		return msg, nil
+	}
+
+	if runErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(runErr, &exitErr) {
+			msg := fmt.Sprintf("Command exited with code %d.", exitErr.ExitCode())
+			if trimmedOutput != "" {
+				msg += "\n\nOutput:\n" + trimmedOutput
+			}
+			if wasTruncated {
+				msg += fmt.Sprintf("\n\n(output truncated at max_output_bytes=%d)", maxOutputBytes)
+			}
+			return msg, nil
+		}
+		return "", fmt.Errorf("failed to execute command: %w", runErr)
+	}
+
+	if trimmedOutput == "" {
+		return "Command completed successfully with no output.", nil
+	}
+	if wasTruncated {
+		return trimmedOutput + fmt.Sprintf("\n\n(output truncated at max_output_bytes=%d)", maxOutputBytes), nil
+	}
+	return trimmedOutput, nil
+}
+
 func readFiles(input json.RawMessage) (string, error) {
 	args := ReadFilesInput{}
 	raw := strings.TrimSpace(string(input))
@@ -450,6 +577,16 @@ func readFiles(input json.RawMessage) (string, error) {
 	}
 
 	return string(content), nil
+}
+
+func truncateOutput(output []byte, maxBytes int) (string, bool) {
+	if maxBytes < 1 {
+		maxBytes = defaultBashMaxOutputBytes
+	}
+	if len(output) <= maxBytes {
+		return string(output), false
+	}
+	return string(output[:maxBytes]), true
 }
 
 func listFiles(input json.RawMessage) (string, error) {

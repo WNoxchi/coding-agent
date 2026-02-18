@@ -29,6 +29,8 @@ const (
 
 	defaultListFilesMaxEntries = 500
 	hardListFilesMaxEntries    = 2000
+	defaultReadFilesMaxBytes   = 32_000
+	hardReadFilesMaxBytes      = 256_000
 
 	userColor   = "\x1b[38;2;102;178;255m"
 	claudeColor = "\x1b[38;2;217;119;6m"
@@ -65,6 +67,11 @@ type ListFilesInput struct {
 	Path       string `json:"path,omitempty"`
 	Recursive  *bool  `json:"recursive,omitempty"`
 	MaxEntries int    `json:"max_entries,omitempty"`
+}
+
+type ReadFilesInput struct {
+	Path     string `json:"path"`
+	MaxBytes int    `json:"max_bytes,omitempty"`
 }
 
 func main() {
@@ -318,6 +325,12 @@ func runTool(toolMap map[string]ToolDefinition, toolUse ToolUse) (string, bool) 
 func registeredTools() []ToolDefinition {
 	return []ToolDefinition{
 		{
+			Name:        "read_files",
+			Description: "Read the contents of a file in the current workspace. Use this to inspect specific files after discovering paths with list_files.",
+			InputSchema: readFilesInputSchema(),
+			Function:    readFiles,
+		},
+		{
 			Name:        "list_files",
 			Description: "List files and directories in the current workspace. Use this to inspect the filesystem before reading or editing files.",
 			InputSchema: listFilesInputSchema(),
@@ -351,6 +364,27 @@ func buildToolRegistry(defs []ToolDefinition) (map[string]ToolDefinition, []anth
 	return toolMap, anthropicTools, nil
 }
 
+func readFilesInputSchema() anthropic.ToolInputSchemaParam {
+	return anthropic.ToolInputSchemaParam{
+		Properties: map[string]any{
+			"path": map[string]any{
+				"type":        "string",
+				"description": "Relative file path within the current workspace.",
+			},
+			"max_bytes": map[string]any{
+				"type":        "integer",
+				"description": fmt.Sprintf("Maximum bytes to read from the file. Defaults to %d, capped at %d.", defaultReadFilesMaxBytes, hardReadFilesMaxBytes),
+				"minimum":     1,
+				"maximum":     hardReadFilesMaxBytes,
+			},
+		},
+		Required: []string{"path"},
+		ExtraFields: map[string]any{
+			"additionalProperties": false,
+		},
+	}
+}
+
 func listFilesInputSchema() anthropic.ToolInputSchemaParam {
 	return anthropic.ToolInputSchemaParam{
 		Properties: map[string]any{
@@ -373,6 +407,49 @@ func listFilesInputSchema() anthropic.ToolInputSchemaParam {
 			"additionalProperties": false,
 		},
 	}
+}
+
+func readFiles(input json.RawMessage) (string, error) {
+	args := ReadFilesInput{}
+	raw := strings.TrimSpace(string(input))
+	if raw == "" {
+		raw = "{}"
+	}
+	if err := json.Unmarshal([]byte(raw), &args); err != nil {
+		return "", fmt.Errorf("invalid read_files input: %w", err)
+	}
+
+	maxBytes := defaultReadFilesMaxBytes
+	if args.MaxBytes > 0 {
+		maxBytes = args.MaxBytes
+	}
+	if maxBytes > hardReadFilesMaxBytes {
+		maxBytes = hardReadFilesMaxBytes
+	}
+
+	absFile, displayPath, err := resolveWorkspaceFile(args.Path)
+	if err != nil {
+		return "", err
+	}
+
+	content, err := os.ReadFile(absFile)
+	if err != nil {
+		return "", fmt.Errorf("failed to read file %q: %w", displayPath, err)
+	}
+
+	truncated := false
+	if len(content) > maxBytes {
+		content = content[:maxBytes]
+		truncated = true
+	}
+
+	if truncated {
+		fmt.Fprintf(os.Stdout, "Read %s (%d bytes, truncated at max_bytes=%d)\n", displayPath, len(content), maxBytes)
+	} else {
+		fmt.Fprintf(os.Stdout, "Read %s (%d bytes)\n", displayPath, len(content))
+	}
+
+	return string(content), nil
 }
 
 func listFiles(input json.RawMessage) (string, error) {
@@ -420,6 +497,54 @@ func listFiles(input json.RawMessage) (string, error) {
 	}
 
 	return string(encoded), nil
+}
+
+func resolveWorkspaceFile(pathArg string) (string, string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to resolve working directory: %w", err)
+	}
+
+	pathArg = strings.TrimSpace(pathArg)
+	if pathArg == "" {
+		return "", "", errors.New("path is required")
+	}
+	if filepath.IsAbs(pathArg) {
+		return "", "", errors.New("path must be relative to the current workspace")
+	}
+
+	clean := filepath.Clean(pathArg)
+	if clean == "." {
+		return "", "", errors.New("path must point to a file")
+	}
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", "", errors.New("path escapes the current workspace")
+	}
+
+	abs := filepath.Join(cwd, clean)
+	abs, err = filepath.Abs(abs)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to resolve absolute path: %w", err)
+	}
+
+	rel, err := filepath.Rel(cwd, abs)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to resolve relative path: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", "", errors.New("path escapes the current workspace")
+	}
+
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to access path %q: %w", clean, err)
+	}
+	if info.IsDir() {
+		return "", "", fmt.Errorf("path is a directory: %s", filepath.ToSlash(rel))
+	}
+
+	display := filepath.ToSlash(rel)
+	return abs, display, nil
 }
 
 func resolveWorkspaceDir(pathArg string) (string, string, error) {
